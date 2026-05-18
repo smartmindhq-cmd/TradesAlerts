@@ -1,0 +1,149 @@
+name: XAUUSD Entry Alert
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # every 5 minutes
+  workflow_dispatch:        # manual trigger for testing
+
+jobs:
+  check-price:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check XAUUSD price and alert
+        env:
+          TG_BOT: ${{ secrets.TG_BOT }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+        run: |
+          python3 << 'EOF'
+          import os, urllib.request, urllib.parse, json, sys
+
+          ENTRY = 4522.001
+          SL    = 4577.605
+          TP    = 4349.52
+
+          TG_BOT  = os.environ['TG_BOT']
+          TG_CHAT = os.environ['TG_CHAT']
+
+          TELEGRAPH_TOKEN = '3b1de5932b4fe8d5419e374f031e06193e41264cb35a9a0350fed79db35a'
+          TELEGRAPH_PAGE  = 'XAUUSD-Cloud-State-05-17'
+
+          # ── Read Telegraph state ──────────────────────────────────────────
+          def read_state():
+              try:
+                  req = urllib.request.Request(
+                      f'https://api.telegra.ph/getPage/{TELEGRAPH_PAGE}?return_content=true',
+                      headers={'User-Agent': 'Mozilla/5.0'}
+                  )
+                  with urllib.request.urlopen(req, timeout=10) as r:
+                      data = json.loads(r.read())
+                  content = data.get('result', {}).get('content', [])
+                  # State is stored as the text of the first <p> node
+                  for node in content:
+                      if isinstance(node, dict) and node.get('tag') == 'p':
+                          children = node.get('children', [])
+                          if children and isinstance(children[0], str):
+                              return json.loads(children[0])
+              except Exception as e:
+                  print(f'Telegraph read failed: {e}')
+              return {}
+
+          def write_state(state):
+              try:
+                  text = json.dumps(state)
+                  content = json.dumps([{"tag": "p", "children": [text]}])
+                  body = urllib.parse.urlencode({
+                      'access_token': TELEGRAPH_TOKEN,
+                      'path': TELEGRAPH_PAGE,
+                      'title': 'XAUUSD Cloud State',
+                      'content': content
+                  }).encode()
+                  req = urllib.request.Request(
+                      'https://api.telegra.ph/editPage',
+                      data=body,
+                      headers={'Content-Type': 'application/x-www-form-urlencoded'}
+                  )
+                  with urllib.request.urlopen(req, timeout=10) as r:
+                      result = json.loads(r.read())
+                  if not result.get('ok'):
+                      print(f'Telegraph write failed: {result}')
+              except Exception as e:
+                  print(f'Telegraph write error: {e}')
+
+          # ── Fetch live gold price ─────────────────────────────────────────
+          price = None
+          for host in ['query2', 'query1']:
+              try:
+                  req = urllib.request.Request(
+                      f'https://{host}.finance.yahoo.com/v8/finance/chart/GC%3DF?interval=1m&range=1d',
+                      headers={'User-Agent': 'Mozilla/5.0'}
+                  )
+                  with urllib.request.urlopen(req, timeout=10) as r:
+                      data = json.loads(r.read())
+                  price = data['chart']['result'][0]['meta']['regularMarketPrice']
+                  if price:
+                      break
+              except Exception as e:
+                  print(f'Price fetch failed ({host}): {e}')
+
+          if not price or price < 1500 or price > 9000:
+              print(f'Invalid price: {price}')
+              sys.exit(0)
+
+          print(f'XAUUSD: {price:.2f} | Entry: {ENTRY}')
+
+          state = read_state()
+          print(f'State: {state}')
+
+          # Price back above entry — reset flag
+          if price > ENTRY + 5:
+              if state.get('ghET'):
+                  state['ghET'] = False
+                  write_state(state)
+                  print('Price above entry — reset ghET flag')
+              else:
+                  print('Price above entry — no action')
+              sys.exit(0)
+
+          # Price at or below entry
+          if price <= ENTRY:
+              if state.get('ghET'):
+                  print(f'Entry already alerted (ghET=True) — skipping')
+                  sys.exit(0)
+
+              profit_pts = ENTRY - price
+              pts_to_tp  = price - TP
+              pts_to_sl  = SL - price
+
+              msg = (
+                  f'🔔 ENTRY TRIGGERED — ReiMrmoney 👋\n'
+                  f'Trade is now LIVE. Price crossed your entry.\n\n'
+                  f'📍 XAUUSD (Gold) · Short — live {price:.2f}\n\n'
+                  f'YOUR MARKED SETUP:\n'
+                  f'• Entry 4522.00\n'
+                  f'• SL    4577.61  (+55.6 pts above entry)\n'
+                  f'• TP    4349.52  (-172.5 pts below entry)\n'
+                  f'• R:R ≈ 1:3.10\n'
+                  f'• Status: 🟢 TRADE LIVE — +{profit_pts:.1f} pts in profit\n'
+                  f'• To TP: {pts_to_tp:.1f} pts | To SL: {pts_to_sl:.1f} pts'
+              )
+
+              payload = json.dumps({'chat_id': TG_CHAT, 'text': msg}).encode()
+              req = urllib.request.Request(
+                  f'https://api.telegram.org/bot{TG_BOT}/sendMessage',
+                  data=payload,
+                  headers={'Content-Type': 'application/json'},
+                  method='POST'
+              )
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  result = json.loads(r.read())
+
+              if result.get('ok'):
+                  print(f'✅ Alert sent! Price: {price:.2f}')
+                  state['ghET'] = True
+                  write_state(state)
+              else:
+                  print(f'❌ Telegram failed: {result}')
+                  sys.exit(1)
+          else:
+              print(f'Price {price:.2f} still above entry {ENTRY} — no alert')
+          EOF
